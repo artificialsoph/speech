@@ -1,0 +1,222 @@
+import keras
+import keras.backend as K
+import kapre
+import pandas as pd
+import scipy.io.wavfile as wav
+import numpy as np
+import random
+import arrow
+import threading
+import pprint
+from soph import ex_generator
+
+# https://github.com/keunwoochoi/kapre
+
+
+ex_df = pd.read_pickle("data/ex_df.pkl")
+
+src_args = {
+    "dropout_prob": .1,
+    "activation": "elu",
+    "batch_size": 128,
+    "regularize": True,
+    "l2_reg": 0.0005,
+    "init_stdd": 0.01,
+    "filters_start": 40,
+    "filters_step": 10,
+    "kernel_size": 10,
+    "cnn_pad": "same",
+    "cnn_stride": 1,
+    "n_mfcc": 20,
+    "n_mels": 30,
+    "n_dft": 256,
+    "n_hop": 128,
+    "pool": "max",
+    "pool_pad": "same",
+    "batch_normalize": True,
+    "train_state": ["train"],
+    "val_state": ["val", "test"],
+    "p_transform": 1,
+    "vol_range": .1,
+    "shift": 1,
+}
+num_cat = 12
+pprint.pprint(src_args)
+start_time = arrow.now()
+current_time = start_time.to('US/Eastern').format('YYYY-MM-DD-HH-mm')
+
+input_layer = keras.layers.Input(shape=(1, 16000))
+input_block = kapre.time_frequency.MFCC(n_mfcc=int(src_args["n_mfcc"]),
+                                        n_mels=int(src_args["n_mels"]),
+                                        n_dft=int(src_args["n_dft"]),
+                                        power_melgram=2.0,
+                                        return_decibel_melgram=True,)(input_layer)
+
+drop = src_args["dropout_prob"]
+init = keras.initializers.TruncatedNormal(stddev=src_args["init_stdd"])
+if src_args["regularize"]:
+    reg = keras.regularizers.l2(src_args["l2_reg"])
+else:
+    reg = None
+
+
+def pool(x):
+    """ add a pool layer to X according to src_args or
+    """
+
+    _, nin1, nin2, _ = x.shape.as_list()
+
+    k = 2
+    s = 2
+    if src_args["pool_pad"] == "valid":
+        p = 0
+    else:
+        p = k
+
+    def calc_dim(x): return int(((x + 2 * p - k) / s) + 1)
+
+    if (calc_dim(nin1) < 1) or (calc_dim(nin2) < 1):
+        return x, False
+
+    if src_args["pool"] == "max":
+        return keras.layers.MaxPool2D(padding=src_args["pool_pad"])(x), True
+    elif src_args["pool"] == "avg":
+        return keras.layers.AvgPool2D(padding=src_args["pool_pad"])(x), True
+
+
+def conv(x, i=0):
+    """ add a conv layer to X according to src_args or
+    """
+
+    _, nin1, nin2, _ = x.shape.as_list()
+
+    if (nin1 == 1) or (nin2 == 1):
+        return x, False
+
+    k = max(2, min(nin1 // 2, nin2 // 2, src_args["kernel_size"]))
+    s = 1
+
+    if src_args["cnn_pad"] == "valid":
+        p = 0
+    else:
+        p = k
+
+    def calc_dim(x): return int(((x + 2 * p - k) / s) + 1)
+
+    if (calc_dim(nin1) < 1) or (calc_dim(nin2) < 1):
+        return x, False
+
+    return keras.layers.Conv2D(
+        filters=int(src_args["filters_start"] + i * src_args["filters_step"]),
+        kernel_size=int(k),
+        padding=src_args["cnn_pad"],
+        strides=int(src_args["cnn_stride"]),
+        activation=src_args["activation"],
+        kernel_initializer=init,
+        kernel_regularizer=reg,
+        bias_regularizer=reg)(x), True
+
+
+cnn_block = input_block
+continue_flag = True
+cnn_i = 0
+while continue_flag:
+
+    cnn_block, cnn_flag = conv(cnn_block, cnn_i)
+    if not cnn_flag:
+        continue_flag = False
+        break
+    cnn_i += 1
+
+    cnn_block, pool_flag = pool(cnn_block)
+    if not pool_flag:
+        continue_flag = False
+        break
+
+    if src_args["batch_normalize"]:
+        cnn_block = keras.layers.BatchNormalization()(cnn_block)
+
+    cnn_block = keras.layers.Dropout(src_args["dropout_prob"])(cnn_block)
+
+out_block = cnn_block
+out_block = keras.layers.Flatten()(out_block)
+output_layer = keras.layers.Dense(num_cat, activation="softmax")(out_block)
+
+cnn_model = keras.Model(inputs=input_layer, outputs=output_layer)
+cnn_model.summary()
+
+log_base = "logs/cnn/{}/".format(current_time)
+callbacks = [
+    keras.callbacks.TensorBoard(
+        log_dir=log_base + 'tb',
+        batch_size=src_args["batch_size"],
+        histogram_freq=0,
+        write_grads=False,
+        write_images=True
+    ),
+    keras.callbacks.ModelCheckpoint(
+        filepath=log_base + 'model-checkpoint.hdf5',
+        monitor='val_loss',
+        verbose=1,
+        save_best_only=True,
+        save_weights_only=False,
+        mode='auto',
+        period=1),
+    keras.callbacks.CSVLogger(log_base + 'training.log'),
+    keras.callbacks.EarlyStopping(patience=4, verbose=1),
+    keras.callbacks.ReduceLROnPlateau(
+        factor=0.1, patience=1, verbose=1, min_lr=1e-8)
+]
+
+cnn_model.compile(
+    loss='sparse_categorical_crossentropy',
+    optimizer='nadam',
+    metrics=['accuracy'])
+
+
+def launchTensorBoard():
+    import os
+    os.system('pkill tensorboard')
+    os.system('tensorboard --logdir=' + log_base + 'tb')
+    return
+
+
+t = threading.Thread(target=launchTensorBoard, args=([]))
+t.start()
+
+val_data = next(ex_generator(
+    batch_size=sum(ex_df.state.isin(src_args["val_state"])),
+    shuffle=False,
+    state=src_args["val_state"],
+    vol_range=0,
+    displacement=0,
+    p_transform=0))
+
+history = cnn_model.fit_generator(
+    generator=ex_generator(
+        batch_size=src_args["batch_size"],
+        shuffle=True,
+        state=src_args["train_state"],
+        vol_range=src_args["vol_range"],
+        shift=src_args["shift"],
+        p_transform=src_args["p_transform"]),
+    steps_per_epoch=sum(ex_df.state.isin(
+        src_args["train_state"])) / src_args["batch_size"],
+    epochs=200,
+    verbose=1,
+    max_queue_size=100,
+    callbacks=callbacks,
+    validation_data=val_data
+)
+
+out_dict = src_args
+out_dict["train_loss"] = np.min(history.history["loss"])
+out_dict["train_acc"] = np.max(history.history["acc"])
+out_dict["val_loss"] = np.min(history.history["val_loss"])
+out_dict["val_acc"] = np.max(history.history["val_acc"])
+out_dict["current_time"] = current_time
+out_dict["elapsed"] = (arrow.now() - start_time).seconds
+out_dict["end_time"] = arrow.now().to('US/Eastern').format('YYYY-MM-DD-HH-mm')
+
+with open("logs/cnn-log", "a") as f:
+    f.writelines(str(out_dict))
